@@ -15,6 +15,10 @@ not a bloated docker/podman container, a simple system service just like forgejo
 4. **Read-Only Dashboard:** The WebUI exercises zero control over your infrastructure; it exists solely to display configured playbooks and provide deep links to completed run logs directly on your Forgejo server.
 5. **State Enforced via Restarts:** To ensure connected AI clients safely re-evaluate available tools and configurations, all state updates rely on an explicit service lifecycle restart (`service ansibot restart`).
 
+
+![Screenshot 1](screenshots/ansibot_logs.png)
+![Screenshot 2](screenshots/ansibot_playbooks.png)
+
 ## Workflow
 
 1. Drop a new playbook into your setup.
