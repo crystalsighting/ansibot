@@ -1,0 +1,11 @@
+# useful exports so pip installs work cleanly on FreeBSD
+export CPPFLAGS="-I/usr/local/include"
+export LDFLAGS="-L/usr/local/lib"
+export PKG_CONFIG_PATH="/usr/local/libdata/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+# ansible playbooks
+export ANSIBOT_CONFIG=/usr/local/etc/ansibot/ansibot.conf
+export ANSIBOT_PLAYBOOKS="$HOME/playbooks"
+export ANSIBLE_CONFIG="$HOME/playbooks/ansible.cfg"
+export PATH="$HOME/.venv/bin:$HOME/bin:$PATH"
+export CRYPTOGRAPHY_OPENSSL_NO_LEGACY=1

@@ -56,6 +56,7 @@ python3.14 -m venv .venv
 mkdir -p /usr/local/etc/ansibot
 cp ansibot/startup-scripts/freebsd/ansibot /usr/local/etc/rc.d
 cp ansibot/startup-scripts/freebsd/ansibot.conf /usr/local/etc/ansibot
+cp ansibot/startup-scripts/freebsd/bash_profile ~/.bash_profile
 cp ansibot/startup-scripts/playbook.yml /usr/local/etc/ansibot
 cp -rp ansibot/bin ~
 cp -rp ansibot/playbooks ~
@@ -111,3 +112,11 @@ ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ""
 ```
 * Stick your ~/.ssh/id_ed25519.pub contents into .ssh/authorized_keys on all target servers
 
+## Example workflow
+```
+su - act_runner
+cd playbooks
+nano hosts OR ansible.cnf OR someplaybook (to work with playbooks)
+sudo nano /usr/local/etc/ansibot.conf ( add your playbook to MCP list)
+service ansibot restart
+```
