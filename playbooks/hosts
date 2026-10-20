@@ -1,0 +1,17 @@
+# This is really just a default block to set ssh port/ssh user/path to python for each host
+# so you only have to edit it once per host
+
+[inventory]
+localhost ansible_connection=local
+192.168.3.1 ansible_port=22 ansible_user=myuser display=HOST1
+192.168.3.4 ansible_port=22 ansible_user=myuser display=HOST2
+192.168.3.5 ansible_port=22 ansible_user=myuser display=HOST3
+
+# This applies the fallback logic to every host listed in [inventory] above
+[inventory:vars]
+ansible_python_interpreter=auto_silent
+ansible_python_interpreter_fallback=["~/.venv/bin/python", "python3", "python3.14"]
+[test]
+localhost
+#192.168.3.4
+#192.168.3.5

@@ -1,0 +1,655 @@
+#!/usr/bin/env python3
+from fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import HTMLResponse
+import asyncio
+import atexit
+import base64
+import configparser
+import httpx
+import json
+import os
+import sys
+import syslog
+from datetime import datetime
+
+# Optional MCP auth (StaticTokenVerifier)
+try:
+    from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
+except ImportError:
+    StaticTokenVerifier = None  # type: ignore
+
+# ==========================================
+# ENVIRONMENT & CENTRAL CONFIGURATION
+# ==========================================
+if os.environ.get("ANSIBOT_CONFIG"):
+    ANSIBOT_CONFIG_PATH = os.environ["ANSIBOT_CONFIG"]
+    CONFIG_SOURCE = "Environment Variable (ANSIBOT_CONFIG)"
+elif sys.platform.startswith("freebsd"):
+    ANSIBOT_CONFIG_PATH = "/usr/local/etc/ansibot/ansibot.conf"
+    CONFIG_SOURCE = "FreeBSD System Default"
+else:
+    ANSIBOT_CONFIG_PATH = "/etc/ansibot/ansibot.conf"
+    CONFIG_SOURCE = "Linux System Default"
+
+DETECTED_OS = "FreeBSD" if sys.platform.startswith("freebsd") else "Linux"
+CONFIG_EXISTS = os.path.exists(ANSIBOT_CONFIG_PATH)
+CONFIG_STATUS = "Found" if CONFIG_EXISTS else "NOT FOUND!"
+ANSIBOT_HOME = os.path.dirname(ANSIBOT_CONFIG_PATH)
+
+LOG_FLAGS = syslog.LOG_PID | syslog.LOG_NDELAY | syslog.LOG_CONS
+syslog.openlog("ansibot", LOG_FLAGS, syslog.LOG_LOCAL5)
+
+if not os.path.exists(ANSIBOT_CONFIG_PATH):
+    err_msg = f"Fatal Error: ANSIBOT configuration file not found at {ANSIBOT_CONFIG_PATH}"
+    print(err_msg, file=sys.stderr)
+    syslog.syslog(syslog.LOG_ERR, err_msg)
+    sys.exit(1)
+
+app_config = configparser.ConfigParser(inline_comment_prefixes=(";", "#"))
+app_config.read(ANSIBOT_CONFIG_PATH)
+
+try:
+    ANSIBOT_HOST = app_config.get("server", "host", fallback="0.0.0.0")
+    ANSIBOT_PORT = app_config.getint("server", "port", fallback=8765)
+    ANSIBOT_LIMIT = app_config.getint("server", "limit", fallback=30)
+    ANSIBOT_VERIFY_SSL = app_config.getboolean("server", "verify_ssl", fallback=False)
+    ANSIBOT_MCP_TOKEN = app_config.get("server", "token", fallback="").strip()
+
+    FORGEJO_URL = app_config.get("forgejo", "url").rstrip("/")
+    FORGEJO_OWNER = app_config.get("forgejo", "owner")
+    FORGEJO_REPO = app_config.get("forgejo", "repo")
+    FORGEJO_TOKEN = app_config.get("forgejo", "token")
+    FORGEJO_PRIVATE = app_config.getboolean("forgejo", "private", fallback=True)
+    FORGEJO_WORKFLOW_PATH = app_config.get("forgejo", "workflow", fallback="playbook.yml")
+    FORGEJO_WORKFLOW_NAME = os.path.basename(FORGEJO_WORKFLOW_PATH)
+except (configparser.NoSectionError, configparser.NoOptionError) as e:
+    err_msg = f"Fatal Error: Missing required settings in {ANSIBOT_CONFIG_PATH}: {e}"
+    print(err_msg, file=sys.stderr)
+    syslog.syslog(syslog.LOG_ERR, err_msg)
+    sys.exit(1)
+
+PLAYBOOK_DIR = os.environ.get(
+    "ANSIBOT_PLAYBOOKS",
+    app_config.get(
+        "server",
+        "playbooks",
+        fallback=os.path.join(ANSIBOT_HOME, "playbooks"),
+    ),
+)
+
+_mcp_auth = None
+if ANSIBOT_MCP_TOKEN:
+    if StaticTokenVerifier is None:
+        print(
+            "[!] server.token is set but StaticTokenVerifier is not available "
+            "(upgrade fastmcp). MCP endpoint will be unauthenticated.",
+            file=sys.stderr,
+        )
+        syslog.syslog(syslog.LOG_ERR, "MCP token set but StaticTokenVerifier missing")
+    else:
+        _mcp_auth = StaticTokenVerifier(
+            tokens={
+                ANSIBOT_MCP_TOKEN: {
+                    "client_id": "ansibot",
+                    "scopes": ["ansibot"],
+                }
+            },
+            required_scopes=["ansibot"],
+        )
+
+mcp = FastMCP("ANSIBOT server", auth=_mcp_auth)
+
+# ==========================================
+# LOGGING + SHARED HTTP CLIENT
+# ==========================================
+def log(level: int, msg: str) -> None:
+    print(msg)
+    syslog.syslog(level, msg)
+
+
+_http_client: httpx.AsyncClient | None = None
+
+
+def get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(verify=ANSIBOT_VERIFY_SSL, timeout=30.0)
+    return _http_client
+
+
+def reset_http_client() -> None:
+    global _http_client
+    _http_client = None
+
+
+atexit.register(reset_http_client)
+
+# ==========================================
+# BOOTSTRAPPER LOGIC
+# ==========================================
+async def bootstrap_forgejo():
+    log(syslog.LOG_NOTICE, "[*] Running Forgejo pre-flight checks...")
+    headers = {
+        "Authorization": f"token {FORGEJO_TOKEN}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    try:
+        client = get_http_client()
+        me_resp = await client.get(f"{FORGEJO_URL}/api/v1/user", headers=headers)
+        if me_resp.status_code == 200:
+            authenticated_user = me_resp.json().get("username")
+            if authenticated_user != FORGEJO_OWNER:
+                log(
+                    syslog.LOG_ERR,
+                    f"[!] Config Mismatch: Token belongs to '{authenticated_user}', "
+                    f"but FORGEJO_OWNER is set to '{FORGEJO_OWNER}'.",
+                )
+                return
+        else:
+            log(
+                syslog.LOG_ERR,
+                f"[!] Unable to authenticate API token: {me_resp.status_code} - {me_resp.text}",
+            )
+            return
+
+        repo_url = f"{FORGEJO_URL}/api/v1/repos/{FORGEJO_OWNER}/{FORGEJO_REPO}"
+        resp = await client.get(repo_url, headers=headers)
+        if resp.status_code == 404:
+            log(
+                syslog.LOG_NOTICE,
+                f"[*] Repository {FORGEJO_OWNER}/{FORGEJO_REPO} not found. Creating it...",
+            )
+            c_resp = await client.post(
+                f"{FORGEJO_URL}/api/v1/user/repos",
+                headers=headers,
+                json={
+                    "name": FORGEJO_REPO,
+                    "description": "Ansibot automated playbook execution repository",
+                    "auto_init": True,
+                    "private": FORGEJO_PRIVATE,
+                },
+            )
+            if c_resp.status_code not in (201, 200):
+                log(syslog.LOG_ERR, f"[!] Failed to create repo: {c_resp.text}")
+                return
+            log(syslog.LOG_NOTICE, "[+] Repository created successfully.")
+        elif resp.status_code == 200:
+            log(syslog.LOG_NOTICE, f"[+] Repository {FORGEJO_OWNER}/{FORGEJO_REPO} exists.")
+        else:
+            log(syslog.LOG_ERR, f"[!] Error checking repo: {resp.status_code} - {resp.text}")
+            return
+
+        workflow_repo_path = f".forgejo/workflows/{FORGEJO_WORKFLOW_NAME}"
+        file_url = (
+            f"{FORGEJO_URL}/api/v1/repos/{FORGEJO_OWNER}/{FORGEJO_REPO}"
+            f"/contents/{workflow_repo_path}"
+        )
+        if not os.path.isfile(FORGEJO_WORKFLOW_PATH):
+            log(syslog.LOG_ERR, f"[!] Local template not found at {FORGEJO_WORKFLOW_PATH}")
+            return
+
+        with open(FORGEJO_WORKFLOW_PATH, "r", encoding="utf-8") as f:
+            local_content = f.read()
+        local_b64 = base64.b64encode(local_content.encode("utf-8")).decode("utf-8")
+        f_resp = await client.get(file_url, headers=headers)
+
+        if f_resp.status_code == 404:
+            log(syslog.LOG_NOTICE, f"[*] Workflow {workflow_repo_path} missing. Injecting...")
+            pf_resp = await client.post(
+                file_url,
+                headers=headers,
+                json={
+                    "content": local_b64,
+                    "message": f"Auto-create Ansibot workflow: {FORGEJO_WORKFLOW_NAME}",
+                    "branch": "main",
+                },
+            )
+            if pf_resp.status_code in (201, 200):
+                log(syslog.LOG_NOTICE, f"[+] Workflow {workflow_repo_path} injected.")
+            else:
+                log(syslog.LOG_ERR, f"[!] Failed to create workflow: {pf_resp.text}")
+        elif f_resp.status_code == 200:
+            remote_data = f_resp.json()
+            remote_sha = remote_data.get("sha")
+            remote_b64 = remote_data.get("content", "").replace("\n", "").replace("\r", "")
+            try:
+                remote_content = base64.b64decode(remote_b64).decode("utf-8", errors="replace")
+            except Exception:
+                remote_content = ""
+            if local_content != remote_content:
+                log(syslog.LOG_NOTICE, f"[*] Updating workflow from {FORGEJO_WORKFLOW_PATH}...")
+                put_resp = await client.put(
+                    file_url,
+                    headers=headers,
+                    json={
+                        "content": local_b64,
+                        "sha": remote_sha,
+                        "message": f"Auto-update Ansibot workflow: {FORGEJO_WORKFLOW_NAME}",
+                        "branch": "main",
+                    },
+                )
+                if put_resp.status_code == 200:
+                    log(syslog.LOG_NOTICE, f"[+] Workflow {workflow_repo_path} updated.")
+                else:
+                    log(
+                        syslog.LOG_ERR,
+                        f"[!] Failed to update workflow: {put_resp.status_code} - {put_resp.text}",
+                    )
+            else:
+                log(syslog.LOG_NOTICE, f"[+] Workflow {workflow_repo_path} up to date.")
+        else:
+            log(syslog.LOG_ERR, f"[!] Error reading workflow: {f_resp.status_code} - {f_resp.text}")
+    except (httpx.InvalidURL, httpx.RequestError, ValueError) as e:
+        log(syslog.LOG_ERR, f"[!] Network/URL error in bootstrapper: {e}")
+    except Exception as e:
+        log(syslog.LOG_ERR, f"[!] Unexpected bootstrap error: {e}")
+
+
+# ==========================================
+# CORE FORGEJO DISPATCH HELPER
+# ==========================================
+async def run_playbook(playbook_filename: str, extra_vars: dict = None) -> str:
+    playbook_path = os.path.join(PLAYBOOK_DIR, playbook_filename)
+    log_msg = f"Tool invoked: dispatching playbook {playbook_filename} to Forgejo"
+    if extra_vars:
+        log_msg += f" with args: {extra_vars}"
+    log(syslog.LOG_INFO, log_msg)
+
+    if not os.path.exists(playbook_path):
+        err = f"Error: Playbook not found at {playbook_path}"
+        log(syslog.LOG_ERR, err)
+        return err
+
+    url = (
+        f"{FORGEJO_URL}/api/v1/repos/{FORGEJO_OWNER}/{FORGEJO_REPO}"
+        f"/actions/workflows/{FORGEJO_WORKFLOW_NAME}/dispatches"
+    )
+    headers = {
+        "Authorization": f"token {FORGEJO_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "ref": "main",
+        "inputs": {
+            "playbook": playbook_filename,
+            "extravars": json.dumps(extra_vars) if extra_vars else "{}",
+        },
+    }
+    try:
+        client = get_http_client()
+        response = await client.post(url, json=payload, headers=headers)
+        if response.status_code == 204:
+            return (
+                f"'{playbook_filename}' sent. "
+                f"Logs: forgejo_list_workflow_runs("
+                f"owner='{FORGEJO_OWNER}', repo='{FORGEJO_REPO}')"
+            )
+        err_text = response.text
+        log(syslog.LOG_ERR, f"Forgejo API dispatch failed ({response.status_code}): {err_text}")
+        return f"Failed to dispatch to Forgejo (Code {response.status_code}): {err_text}"
+    except (httpx.InvalidURL, httpx.RequestError, ValueError) as e:
+        err_msg = f"Network/URL error dispatching {playbook_filename}: {e}"
+        log(syslog.LOG_ERR, err_msg)
+        return err_msg
+    except Exception as e:
+        err_msg = f"Unknown error dispatching {playbook_filename}: {e}"
+        log(syslog.LOG_ERR, err_msg)
+        return err_msg
+
+
+# ==========================================
+# DYNAMIC TOOL REGISTRATION
+# ==========================================
+for tool_name in app_config.sections():
+    if tool_name in ("server", "forgejo"):
+        continue
+    playbook_file = app_config.get(tool_name, "playbook")
+    tool_desc = app_config.get(tool_name, "description", fallback="Execute playbook")
+    raw_args = app_config.get(tool_name, "args", fallback="")
+    arg_list = [a.strip() for a in raw_args.split(",") if a.strip()]
+    sig_def = ", ".join([f"{arg}: str = ''" for arg in arg_list])
+    dict_build = ", ".join([f"'{arg}': {arg}" for arg in arg_list])
+    code = f"""
+@mcp.tool(name="{tool_name}", description="{tool_desc}")
+async def dynamic_tool({sig_def}) -> str:
+    raw_vars = {{{dict_build}}} if {bool(arg_list)} else None
+    cleaned_vars = {{}}
+    if raw_vars:
+        for k, v in raw_vars.items():
+            if v:
+                if isinstance(v, str) and ('{{{{' in v or '}}}}' in v or '{{%' in v or '%}}' in v):
+                    log(syslog.LOG_WARNING, f"Security Block: Jinja2 injection attempted in variable '{{k}}'")
+                    return "Error: Security violation. Jinja2 template characters are blocked."
+                cleaned_vars[k] = v
+    return await run_playbook("{playbook_file}", cleaned_vars if cleaned_vars else None)
+"""
+    exec(
+        code,
+        globals(),
+        {"mcp": mcp, "run_playbook": run_playbook, "syslog": syslog, "log": log},
+    )
+
+
+# ==========================================
+# CUSTOM DASHBOARD ROUTES (UI — use nginx basic auth)
+# ==========================================
+@mcp.custom_route("/", methods=["GET"])
+async def dashboard_ui(request: Request) -> HTMLResponse:
+    rows = ""
+    tool_sections = [s for s in app_config.sections() if s not in ("server", "forgejo")]
+    if tool_sections:
+        for tool_name in tool_sections:
+            playbook_file = app_config.get(tool_name, "playbook", fallback="Unknown")
+            desc = app_config.get(tool_name, "description", fallback="—")
+            rows += f"""
+            <tr>
+                <td class="col-name"><span class="tool">{tool_name}</span></td>
+                <td class="mono pb">{playbook_file}</td>
+                <td class="desc">{desc}</td>
+                <td>
+                    <form action="/run/{tool_name}" method="post" style="margin:0">
+                        <button type="submit" class="btn-run">Run</button>
+                    </form>
+                </td>
+            </tr>
+            """
+    else:
+        rows = (
+            f'<tr><td colspan="4" class="empty">'
+            f"No playbooks found in configuration at {ANSIBOT_CONFIG_PATH}."
+            f"</td></tr>"
+        )
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>ANSIBOT</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0d1117; color: #e6edf3; display: flex; min-height: 100vh; }}
+            .sidebar {{ width: 220px; background: #161b22; border-right: 1px solid #30363d; padding: 24px 16px; position: fixed; top: 0; left: 0; bottom: 0; }}
+            .logo {{ font-size: 1.25rem; font-weight: 700; color: #58a6ff; margin-bottom: 32px; }}
+            .nav a {{ display: block; padding: 10px 12px; color: #8b949e; text-decoration: none; border-radius: 6px; font-size: 0.9rem; margin-bottom: 4px; }}
+            .nav a:hover {{ background: #21262d; color: #e6edf3; }}
+            .nav a.active {{ background: #21262d; color: #58a6ff; font-weight: 500; }}
+            .main {{ margin-left: 220px; flex: 1; padding: 32px 40px; }}
+            h1 {{ font-size: 1.5rem; font-weight: 600; margin-bottom: 8px; }}
+            .subtitle {{ color: #8b949e; font-size: 0.9rem; margin-bottom: 24px; }}
+            table {{ width: 100%; border-collapse: collapse; font-size: 0.875rem; }}
+            thead th {{ text-align: left; padding: 10px 12px; color: #8b949e; font-weight: 500; font-size: 0.75rem; text-transform: uppercase; border-bottom: 1px solid #30363d; }}
+            tbody tr {{ border-bottom: 1px solid #21262d; }}
+            tbody tr:hover {{ background: #161b22; }}
+            td {{ padding: 12px; vertical-align: middle; }}
+            .tool {{ color: #58a6ff; font-weight: 600; }}
+            .pb {{ color: #c9d1d9; }}
+            .mono {{ font-family: ui-monospace, monospace; font-size: 0.82rem; }}
+            .desc {{ color: #8b949e; max-width: 420px; line-height: 1.35; }}
+            .btn-run {{ background: #238636; color: #fff; border: none; padding: 5px 14px; border-radius: 6px; font-size: 0.8rem; font-weight: 600; cursor: pointer; }}
+            .btn-run:hover {{ background: #2ea043; }}
+            .empty {{ color: #8b949e; padding: 32px 12px; }}
+        </style>
+    </head>
+    <body>
+        <aside class="sidebar">
+            <div class="logo">ANSIBOT</div>
+            <nav class="nav">
+                <a href="/" class="active">Playbooks</a>
+                <a href="/logs">Execution Logs</a>
+            </nav>
+        </aside>
+        <main class="main">
+            <h1>Playbooks</h1>
+            <p class="subtitle">Registered Ansible playbooks ready to dispatch</p>
+            <table>
+                <thead>
+                    <tr><th>MCP Tool</th><th>Playbook</th><th>Description</th><th></th></tr>
+                </thead>
+                <tbody>{rows}</tbody>
+            </table>
+        </main>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
+
+
+@mcp.custom_route("/logs", methods=["GET"])
+async def logs_ui(request: Request) -> HTMLResponse:
+    url = (
+        f"{FORGEJO_URL}/api/v1/repos/{FORGEJO_OWNER}/{FORGEJO_REPO}"
+        f"/actions/runs?page=1&limit={ANSIBOT_LIMIT}"
+    )
+    headers = {"Authorization": f"token {FORGEJO_TOKEN}", "Accept": "application/json"}
+    playbook_to_name = {}
+    for section in app_config.sections():
+        if section not in ("server", "forgejo"):
+            pb = app_config.get(section, "playbook", fallback="").strip()
+            if pb:
+                playbook_to_name[pb] = section
+
+    rows = ""
+    error_block = ""
+
+    try:
+        client = get_http_client()
+        response = await client.get(url, headers=headers)
+        if response.status_code == 200:
+            data = response.json()
+            if isinstance(data, dict):
+                runs = data.get("workflow_runs", data.get("runs", []))
+            elif isinstance(data, list):
+                runs = data
+            else:
+                runs = []
+            if not isinstance(runs, list):
+                runs = []
+            runs = runs[:ANSIBOT_LIMIT]
+
+            if not runs:
+                rows = '<tr><td colspan="6" class="empty">No recent runs found.</td></tr>'
+            else:
+                for run in runs:
+                    if not isinstance(run, dict):
+                        continue
+                    db_id = run.get("id", "N/A")
+                    run_index = (
+                        run.get("index_in_repo")
+                        or run.get("run_number")
+                        or run.get("index")
+                        or db_id
+                    )
+                    playbook = None
+                    try:
+                        payload_raw = run.get("event_payload") or ""
+                        if payload_raw:
+                            playbook = json.loads(payload_raw).get("inputs", {}).get("playbook")
+                    except (json.JSONDecodeError, TypeError, AttributeError):
+                        pass
+
+                    tool_name = playbook_to_name.get(playbook) if playbook else None
+                    name_cell = (
+                        f'<span class="tool">{tool_name}</span>'
+                        if tool_name
+                        else '<span class="muted">—</span>'
+                    )
+                    playbook_cell = (
+                        f'<span class="pb">{playbook}</span>'
+                        if playbook
+                        else '<span class="muted">—</span>'
+                    )
+                    status = run.get("status", "unknown")
+                    if status in ["success", "completed"]:
+                        status_class = "st-ok"
+                    elif status in ["failure", "cancelled", "skipped", "error"]:
+                        status_class = "st-fail"
+                    else:
+                        status_class = "st-pending"
+
+                    created_at = run.get("created_at") or run.get("created") or ""
+                    if created_at:
+                        try:
+                            dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                            created_at = dt.strftime("%Y-%m-%d %H:%M")
+                        except (ValueError, TypeError):
+                            pass
+
+                    log_link = run.get("html_url") or (
+                        f"{FORGEJO_URL}/{FORGEJO_OWNER}/{FORGEJO_REPO}/actions/runs/{run_index}"
+                    )
+                    rows += f"""
+                    <tr>
+                        <td class="col-name">{name_cell}</td>
+                        <td class="mono">{playbook_cell}</td>
+                        <td><span class="badge {status_class}">{status}</span></td>
+                        <td class="mono">#{run_index}</td>
+                        <td class="mono muted">{created_at}</td>
+                        <td><a href="{log_link}" target="_blank" class="btn-link">Logs →</a></td>
+                    </tr>
+                    """
+        else:
+            error_block = (
+                f'<div class="error-box"><strong>API Error</strong> — '
+                f"HTTP {response.status_code}<pre>{response.text}</pre></div>"
+            )
+    except (httpx.InvalidURL, httpx.RequestError, ValueError) as e:
+        error_block = (
+            f'<div class="error-box"><strong>URL / Connection Error</strong>'
+            f"<pre>{str(e)}</pre></div>"
+        )
+    except Exception as e:
+        error_block = (
+            f'<div class="error-box"><strong>Unknown Error</strong>'
+            f"<pre>{str(e)}</pre></div>"
+        )
+
+    # Always refresh every 10s while the logs tab is open
+    poll_js = """
+<script>
+  setTimeout(function () { location.reload(); }, 10000);
+</script>
+"""
+
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>ANSIBOT — Logs</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0d1117; color: #e6edf3; display: flex; min-height: 100vh; }}
+            .sidebar {{ width: 220px; background: #161b22; border-right: 1px solid #30363d; padding: 24px 16px; position: fixed; top: 0; left: 0; bottom: 0; }}
+            .logo {{ font-size: 1.25rem; font-weight: 700; color: #58a6ff; margin-bottom: 32px; }}
+            .nav a {{ display: block; padding: 10px 12px; color: #8b949e; text-decoration: none; border-radius: 6px; font-size: 0.9rem; margin-bottom: 4px; }}
+            .nav a:hover {{ background: #21262d; color: #e6edf3; }}
+            .nav a.active {{ background: #21262d; color: #58a6ff; font-weight: 500; }}
+            .main {{ margin-left: 220px; flex: 1; padding: 32px 40px; }}
+            h1 {{ font-size: 1.5rem; font-weight: 600; margin-bottom: 8px; }}
+            .subtitle {{ color: #8b949e; font-size: 0.9rem; margin-bottom: 24px; }}
+            table {{ width: 100%; border-collapse: collapse; font-size: 0.875rem; }}
+            thead th {{ text-align: left; padding: 10px 12px; color: #8b949e; font-weight: 500; font-size: 0.75rem; text-transform: uppercase; border-bottom: 1px solid #30363d; }}
+            tbody tr {{ border-bottom: 1px solid #21262d; }}
+            tbody tr:hover {{ background: #161b22; }}
+            td {{ padding: 12px; vertical-align: middle; }}
+            .tool {{ color: #58a6ff; font-weight: 600; }}
+            .pb {{ color: #c9d1d9; }}
+            .mono {{ font-family: ui-monospace, monospace; font-size: 0.82rem; }}
+            .muted {{ color: #8b949e; }}
+            .badge {{ display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; }}
+            .st-ok {{ background: rgba(46,160,67,0.15); color: #3fb950; }}
+            .st-fail {{ background: rgba(248,81,73,0.15); color: #f85149; }}
+            .st-pending {{ background: rgba(210,153,34,0.15); color: #d29922; }}
+            .btn-link {{ color: #58a6ff; text-decoration: none; font-weight: 500; font-size: 0.85rem; }}
+            .empty {{ color: #8b949e; padding: 32px 12px; }}
+            .error-box {{ background: #161b22; border: 1px solid #f85149; border-radius: 8px; padding: 16px; margin-bottom: 20px; }}
+            .error-box pre {{ margin-top: 8px; color: #8b949e; font-size: 0.8rem; white-space: pre-wrap; }}
+        </style>
+    </head>
+    <body>
+        <aside class="sidebar">
+            <div class="logo">ANSIBOT</div>
+            <nav class="nav">
+                <a href="/">Playbooks</a>
+                <a href="/logs" class="active">Execution Logs</a>
+            </nav>
+        </aside>
+        <main class="main">
+            <h1>Execution Logs</h1>
+            <p class="subtitle">Recent Forgejo Actions runs (limit {ANSIBOT_LIMIT})</p>
+            {error_block}
+            <table>
+                <thead>
+                    <tr>
+                        <th>MCP Tool</th><th>Playbook</th><th>Status</th>
+                        <th>Run</th><th>Triggered</th><th></th>
+                    </tr>
+                </thead>
+                <tbody>{rows}</tbody>
+            </table>
+        </main>
+        {poll_js}
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
+
+
+@mcp.custom_route("/run/{tool_name}", methods=["POST"])
+async def trigger_playbook_web(request: Request) -> HTMLResponse:
+    tool_name = request.path_params.get("tool_name")
+    if (
+        not tool_name
+        or tool_name in ("server", "forgejo")
+        or not app_config.has_section(tool_name)
+    ):
+        return HTMLResponse(
+            "<h2>Error: Playbook target not found.</h2><a href='/'>Go back</a>",
+            status_code=404,
+        )
+    result = await run_playbook(app_config.get(tool_name, "playbook"), None)
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head><title>Dispatch Result</title>
+    <style>
+        body {{ font-family: monospace; background: #121212; color: #e0e0e0; margin: 40px; }}
+        .result-box {{ background: #1e1e1e; border-left: 4px solid #58a6ff; padding: 20px; margin-top: 20px; font-size: 1.1em; }}
+        a {{ color: #58a6ff; text-decoration: none; margin-right: 15px; }}
+    </style></head>
+    <body>
+        <h2>Dispatching: {tool_name}</h2>
+        <div class="result-box">{result}</div>
+        <div>
+            <a href="/">&larr; Return to Dashboard</a>
+            <a href="/logs">View Execution Logs &rarr;</a>
+        </div>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
+
+
+if __name__ == "__main__":
+    mcp_auth_status = "enabled (Bearer)" if _mcp_auth else "disabled"
+    print("=== ANSIBOT FORGEJO BRIDGE STARTUP ===")
+    print(f"Detected OS:            {DETECTED_OS}")
+    print(f"Config Source:          {CONFIG_SOURCE}")
+    print(f"Check ENV Variables:    ANSIBOT_CONFIG ANSIBOT_PLAYBOOKS")
+    print(f"Config File Path:       {ANSIBOT_CONFIG_PATH} [{CONFIG_STATUS}]")
+    print(f"Target Repository:      {FORGEJO_OWNER}/{FORGEJO_REPO}")
+    print(f"Target Workflow Name:   {FORGEJO_WORKFLOW_NAME}")
+    print(f"Local Workflow Path:    {FORGEJO_WORKFLOW_PATH}")
+    print(f"Forgejo Url:            {FORGEJO_URL}")
+    print(f"Verify SSL:             {ANSIBOT_VERIFY_SSL}")
+    print(f"Playbook Directory:     {PLAYBOOK_DIR}")
+    print(f"WEB UI:                 http://{ANSIBOT_HOST}:{ANSIBOT_PORT}/")
+    print(f"WEB UI Logs Limit:      {ANSIBOT_LIMIT}")
+    print(f"MCP Server:             http://{ANSIBOT_HOST}:{ANSIBOT_PORT}/mcp")
+    print(f"MCP Server Auth:        {mcp_auth_status}")
+    print("======================================")
+    asyncio.run(bootstrap_forgejo())
+    reset_http_client()
+    mcp.run(transport="http", host=ANSIBOT_HOST, port=ANSIBOT_PORT)

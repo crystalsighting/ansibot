@@ -1,0 +1,10 @@
+# Core Ansible and automation tools
+ansible
+ansible-dev-tools
+
+# FastMCP and Model Context Protocol SDK
+fastmcp
+mcp[cli]
+
+# misc
+httpx

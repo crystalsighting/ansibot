@@ -1,0 +1,8 @@
+---
+- name: Echo Test Playbook
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Display Passed Arguments
+      ansible.builtin.debug:
+        msg: "Echo received -> message: '{{ message | default('None') }}', count: {{ count | default(1) }}"

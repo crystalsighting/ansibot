@@ -1,0 +1,25 @@
+[Unit]
+Description=Ansibot MCP Host Server
+After=network.target forgejo.service act_runner.service
+
+[Service]
+Type=simple
+User=act_runner
+Group=act_runner
+WorkingDirectory=/var/db/act_runner
+ExecStart=/var/db/act_runner/.venv/bin/python /var/db/act_runner/server.py
+Restart=on-failure
+RestartSec=5
+
+# Environment variables matching your FreeBSD configuration
+Environment=PATH=/var/db/act_runner/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=ANSIBOT_CONFIG=/usr/local/etc/ansibot/ansibot.conf
+Environment=ANSIBOT_PLAYBOOKS=/var/db/act_runner/playbooks
+Environment=PYTHONUNBUFFERED=1
+
+# Log routing
+StandardOutput=append:/var/log/ansibot.log
+StandardError=append:/var/log/ansibot.log
+
+[Install]
+WantedBy=multi-user.target

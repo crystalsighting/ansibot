@@ -1,0 +1,27 @@
+name: Ansibot Forgejo Playbook Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      playbook:
+        description: 'Target playbook path (e.g. test/echo.yml)'
+        required: true
+        type: string
+      extravars:
+        description: 'JSON string of arguments'
+        required: false
+        default: '{}'
+        type: string
+
+jobs:
+  run-ansible:
+    name: Playbook -> ${{ inputs.playbook }}
+    runs-on: router
+    steps:
+      - name: Execute Playbook
+        run: |
+          # source profile as forgejo runner defaults to bash --noprofile --norc -e -o pipefail {0}
+          source ~/.bash_profile
+          cd ~/playbooks
+          echo "Runner path is: $PATH"
+          ansible-playbook "${{ inputs.playbook }}" --extra-vars '${{ inputs.extravars }}'

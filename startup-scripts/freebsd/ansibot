@@ -1,0 +1,48 @@
+#!/bin/sh
+
+# PROVIDE: ansibot
+# REQUIRE: NETWORKING DAEMON forgejo act_runner
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+name="ansibot"
+rcvar="ansibot_enable"
+load_rc_config $name
+
+: ${ansibot_enable:="NO"}
+: ${ansibot_user:="act_runner"}
+: ${ansibot_group:="act_runner"}
+: ${ansibot_python:="/usr/local/bin/python3.14"}
+: ${ansibot_config:="/usr/local/etc/ansibot/ansibot.conf"}
+: ${ansibot_playbooks:="/var/db/act_runner/playbooks"}
+: ${ansibot_cmd:="/var/db/act_runner/bin/ansibot"}
+
+rundir="/var/run/${name}"
+pidfile="${rundir}/${name}.pid"
+logfile="/var/log/${name}/${name}.log"
+logfile2="/var/log/${name}/tools.log"
+
+command="/usr/sbin/daemon"
+procname="${ansibot_python}"
+
+# -f (background) -S (syslog/output) -p (child pid) -t (title)
+command_args="-f -S -p ${pidfile} -o ${logfile} -t ${name} \
+    /usr/bin/env ANSIBOT_CONFIG=${ansibot_config} ANSIBOT_PLAYBOOKS=${ansibot_playbooks} \
+    ${ansibot_python} ${ansibot_cmd}"
+
+start_precmd="ansibot_precmd"
+
+ansibot_precmd() {
+    # 1. Create runtime state directory
+    /usr/bin/install -d -m 755 -o "${ansibot_user}" -g "${ansibot_group}" "${rundir}"
+    # 2. Ensure configuration, playbook, and log directories exist with proper ownership
+    /usr/bin/install -d -m 755 -o "${ansibot_user}" -g "${ansibot_group}" "$(dirname "${ansibot_config}")"
+    /usr/bin/install -d -m 755 -o "${ansibot_user}" -g "${ansibot_group}" "${ansibot_playbooks}"
+    /usr/bin/install -d -m 755 -o "${ansib_user:-$ansibot_user}" -g "${ansibot_group}" "$(dirname "${logfile}")"
+    # 3. Initialize log files
+    /usr/bin/touch "${logfile}" "${logfile2}"
+    /usr/sbin/chown "${ansibot_user}:${ansibot_group}" "${logfile}" "${logfile2}"
+    /bin/chmod 640 "${logfile}" "${logfile2}"
+}
+
+run_rc_command "$1"
