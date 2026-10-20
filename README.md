@@ -12,7 +12,7 @@ not a bloated docker/podman container, a simple system service just like forgejo
 1. **Forgejo-Powered Execution:** Ansibot does not reinvent execution engines. It leverages proven runners (`act_runner`) written in Go to execute and log Ansible playbooks on your own terms via `.forgejo/workflows/playbook.yml`.
 2. **Unified Configuration (`ansibot.conf`):** Everything is defined in a single configuration file—your MCP server settings, Forgejo credentials, and explicit MCP tool definitions mapping directly to your playbooks.
 3. **Frictionless Bootstrapping:** On startup, Ansibot automatically verifies and pushes the required workflow definitions (`playbook.yml`) to your Forgejo repository if they do not already exist or have been updated locally.
-4. **Read-Only Dashboard:** The WebUI exercises zero control over your infrastructure; it exists solely to display configured playbooks and provide deep links to completed run logs directly on your Forgejo server.
+4. **Read-Only Dashboard:** The WebUI exercises zero control over your infrastructure; it exists solely to display configured playbooks and provide deep links to completed run logs directly on your Forgejo server. WebUI allows you to run playbooks and view logs only.
 5. **State Enforced via Restarts:** To ensure connected AI clients safely re-evaluate available tools and configurations, all state updates rely on an explicit service lifecycle restart (`service ansibot restart`).
 
 
@@ -53,6 +53,7 @@ python3.14 -m venv .venv
 .venv/bin/pip install --upgrade pip
 .venv/bin/pip install -r ansibot/requirements.txt
 (as root)
+mkdir -p /usr/local/etc/ansibot
 cp ansibot/startup-scripts/ansibot /usr/local/etc/rc.d
 cp ansibot/startup-scripts/ansibot.conf /usr/local/etc/ansibot
 cp ansibot/startup-scripts/playbook.yml /usr/local/etc/ansibot
