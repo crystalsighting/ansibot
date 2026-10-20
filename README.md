@@ -54,8 +54,8 @@ python3.14 -m venv .venv
 .venv/bin/pip install -r ansibot/requirements.txt
 (as root)
 mkdir -p /usr/local/etc/ansibot
-cp ansibot/startup-scripts/ansibot /usr/local/etc/rc.d
-cp ansibot/startup-scripts/ansibot.conf /usr/local/etc/ansibot
+cp ansibot/startup-scripts/freebsd/ansibot /usr/local/etc/rc.d
+cp ansibot/startup-scripts/freebsd/ansibot.conf /usr/local/etc/ansibot
 cp ansibot/startup-scripts/playbook.yml /usr/local/etc/ansibot
 cp -rp ansibot/bin ~
 cp -rp ansibot/playbooks ~
