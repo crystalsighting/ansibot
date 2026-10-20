@@ -117,6 +117,7 @@ ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ""
 su - act_runner
 cd playbooks
 nano hosts OR ansible.cfg OR someplaybook (to work with playbooks)
-sudo nano /usr/local/etc/ansibot.conf ( add your playbook to MCP list)
+(as root)
+nano /usr/local/etc/ansibot.conf ( add your playbook to MCP list)
 service ansibot restart
 ```
