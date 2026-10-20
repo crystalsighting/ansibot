@@ -46,9 +46,8 @@ pkg install python314 bash
 chsh -s /usr/local/bin/bash act_runner
 su - act_runner
 git clone https://github.com/crystalsighting/ansibot.git
-export CPPFLAGS="-I/usr/local/include"
-export LDFLAGS="-L/usr/local/lib"
-export PKG_CONFIG_PATH="/usr/local/libdata/pkgconfig:${PKG_CONFIG_PATH:-}"
+cp ansibot/startup-scripts/freebsd/bash_profile ~/.bash_profile
+source .bash_profile
 python3.14 -m venv .venv
 .venv/bin/pip install --upgrade pip
 .venv/bin/pip install -r ansibot/requirements.txt
@@ -56,7 +55,6 @@ python3.14 -m venv .venv
 mkdir -p /usr/local/etc/ansibot
 cp ansibot/startup-scripts/freebsd/ansibot /usr/local/etc/rc.d
 cp ansibot/startup-scripts/freebsd/ansibot.conf /usr/local/etc/ansibot
-cp ansibot/startup-scripts/freebsd/bash_profile ~/.bash_profile
 cp ansibot/startup-scripts/playbook.yml /usr/local/etc/ansibot
 cp -rp ansibot/bin ~
 cp -rp ansibot/playbooks ~
