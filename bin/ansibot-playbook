@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+
+import asyncio
+import sys
+from fastmcp import Client
+
+URL = "http://192.168.0.1:8000/mcp"
+BEARER_TOKEN = "769902adfdef2005dn7fe217331f8125d0ce0066824da2cbc74e1ab1a57110ab"
+
+async def main():
+    if len(sys.argv) < 2:
+        print("Usage: ansibot-playbook <tool_name> [key=value ...]")
+        print("Example: ansibot-playbook test-echo message='hello world' count='3'")
+        sys.exit(1)
+
+    tool_name = sys.argv[1]
+    # Parse key=value arguments from the command line
+    args = {}
+    for arg in sys.argv[2:]:
+        if "=" in arg:
+            key, val = arg.split("=", 1)
+            args[key] = val
+
+    try:
+        async with Client(URL, auth=BEARER_TOKEN) as client:
+            result = await client.call_tool(tool_name, arguments=args)
+            text = ""
+            if hasattr(result, 'content'):
+                for block in result.content:
+                    if getattr(block, 'type', None) == "text":
+                        text += block.text
+            else:
+                text = str(result)
+            print(text)
+    except Exception as e:
+        print(f"Error calling {tool_name}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    asyncio.run(main())
