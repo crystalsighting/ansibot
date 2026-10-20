@@ -76,7 +76,6 @@ service ansibot start
 ## Add logging
 ```
 cp ansibot/startup-scripts/freebsd/syslog/ansibot.conf /etc/syslog.d
-mkdir /var/log/ansibot && chown act_runner:act_runner /var/log/ansibot
 service syslogd restart
 ```
 * This will allow you to tail /var/log/ansibot/tools.log to see just tool calls for audit trail.
