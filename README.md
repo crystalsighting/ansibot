@@ -45,7 +45,7 @@ service act_runner start
 pkg install python314 bash
 chsh -s /usr/local/bin/bash act_runner
 su - act_runner
-git clone git@github.com:crystalsighting/ansibot.git
+git clone https://github.com/crystalsighting/ansibot.git
 export CPPFLAGS="-I/usr/local/include"
 export LDFLAGS="-L/usr/local/lib"
 export PKG_CONFIG_PATH="/usr/local/libdata/pkgconfig:${PKG_CONFIG_PATH:-}"
